@@ -6,8 +6,8 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .core import InputValidationError, evaluate
-from .models import EvaluateRequest, EvaluateResponse
+from .core import BaselineViolationError, InputValidationError, capacity, evaluate
+from .models import CapacityRequest, CapacityResponse, EvaluateRequest, EvaluateResponse
 
 app = FastAPI(
     title="直流配电树压降校核 API",
@@ -37,6 +37,7 @@ _FIELD_LABELS = {
     "rated_current": "额定电流",
     "node": "节点",
     "current": "负载电流",
+    "target_node": "目标节点",
 }
 
 _CUSTOM_MESSAGES = {
@@ -93,6 +94,26 @@ async def input_validation_handler(request: Request, exc: InputValidationError) 
     )
 
 
+@app.exception_handler(BaselineViolationError)
+async def baseline_violation_handler(request: Request, exc: BaselineViolationError) -> JSONResponse:
+    details = [
+        {"type": "over_current_segment", **violation}
+        for violation in exc.over_current_segments
+    ]
+    details.extend(
+        {"type": "under_voltage_node", **violation}
+        for violation in exc.under_voltage_nodes
+    )
+    return JSONResponse(
+        status_code=400,
+        content=_error_body(
+            "baseline_violation",
+            "基线校核存在越限，无法计算新增容量",
+            details,
+        ),
+    )
+
+
 @app.post(
     "/evaluate",
     response_model=EvaluateResponse,
@@ -102,6 +123,21 @@ def evaluate_endpoint(payload: EvaluateRequest) -> dict:
     return evaluate(
         source_voltage=payload.source_voltage,
         min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+    )
+
+
+@app.post(
+    "/capacity",
+    response_model=CapacityResponse,
+    summary="计算指定节点可新增的最大恒定负载电流",
+)
+def capacity_endpoint(payload: CapacityRequest) -> dict:
+    return capacity(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        target_node=payload.target_node,
         segments_in=payload.segments,
         loads_in=payload.loads,
     )
@@ -117,6 +153,7 @@ def index() -> dict:
     return {
         "service": "dc-tree-voltage-drop-api",
         "evaluate": "POST /evaluate",
+        "capacity": "POST /capacity",
         "docs": "/docs",
         "health": "/health",
     }
