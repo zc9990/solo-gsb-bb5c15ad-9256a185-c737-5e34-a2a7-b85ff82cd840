@@ -5,12 +5,17 @@
 2. 自叶向根累计每段承载的全部下游电流；
 3. 自根向叶计算各段压降与各节点电压；
 4. 汇总超额定电流线段与欠压节点。
+
+``capacity`` 在基线校核通过的前提下，评估目标节点可追加的最大恒定负载电流：
+目标到 source 路径上的线段电流同步增加，任一节点的新增压降等于它与目标节点
+两条根路径的公共线段电阻之和乘新增电流（兄弟支路经公共上游线段同样受影响）。
 """
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_FLOOR
 from typing import Optional, Sequence
 
 ROOT_NODE = "source"
@@ -27,6 +32,15 @@ class InputValidationError(ValueError):
         self.details = details or []
 
 
+class BaselineViolationError(ValueError):
+    """基线校核已存在超额定电流或欠压，无法评估可增容量。"""
+
+    def __init__(self, message: str, details: Optional[list[str]] = None):
+        super().__init__(message)
+        self.message = message
+        self.details = details or []
+
+
 @dataclass
 class Segment:
     id: str
@@ -36,8 +50,29 @@ class Segment:
     rated_current: float
 
 
+@dataclass
+class _Tree:
+    """校验后的配电树与基线潮流（电流、电压均为未舍入值）。"""
+
+    segments: list[Segment]
+    parent_of: dict[str, str]
+    children_map: dict[str, list[Segment]]
+    order: list[str]  # 自根向叶 BFS 顺序
+    load_map: dict[str, float]
+    min_voltage_override: dict[str, float]
+    node_total: dict[str, float]
+    seg_current: dict[str, float]
+    node_voltage: dict[str, float]
+
+
 def _round(value: float) -> float:
     return round(value, ROUND_DIGITS)
+
+
+def _truncate(value: float) -> float:
+    """向下截断至 6 位小数（先按 1e-9 容差吸附浮点噪声）。"""
+    snapped = Decimal(repr(round(value, ROUND_DIGITS + 3)))
+    return float(snapped.quantize(Decimal("0.000001"), rounding=ROUND_FLOOR))
 
 
 def _validate_and_build_tree(segments_in: Sequence) -> tuple[list[Segment], dict[str, str]]:
@@ -136,8 +171,8 @@ def _aggregate_loads(loads_in: Sequence, known_nodes: set[str]) -> tuple[dict[st
     return load_map, min_voltage_map
 
 
-def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, loads_in: Sequence) -> dict:
-    """执行压降校核，返回可 JSON 序列化的结果字典。"""
+def _prepare_tree(source_voltage: float, segments_in: Sequence, loads_in: Sequence) -> _Tree:
+    """校验输入并计算基线潮流（各段电流、各节点电压，未舍入）。"""
     segments, parent_of = _validate_and_build_tree(segments_in)
 
     children_map: dict[str, list[Segment]] = {}
@@ -164,33 +199,36 @@ def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, l
             seg_current[seg.id] = node_total[seg.child]
             node_total[node] += node_total[seg.child]
 
-    # 自根向叶计算压降与节点电压
+    # 自根向叶计算各节点电压
     node_voltage = {ROOT_NODE: source_voltage}
-    seg_drop: dict[str, float] = {}
     for node in order:
         for seg in children_map.get(node, []):
-            drop = seg_current[seg.id] * seg.resistance
-            seg_drop[seg.id] = drop
-            node_voltage[seg.child] = node_voltage[node] - drop
+            node_voltage[seg.child] = node_voltage[node] - seg_current[seg.id] * seg.resistance
 
-    segment_results = []
+    return _Tree(
+        segments=segments,
+        parent_of=parent_of,
+        children_map=children_map,
+        order=order,
+        load_map=load_map,
+        min_voltage_override=min_voltage_override,
+        node_total=node_total,
+        seg_current=seg_current,
+        node_voltage=node_voltage,
+    )
+
+
+def _node_threshold(tree: _Tree, node: str, min_voltage: float) -> float:
+    """节点生效的最低允许电压（节点级覆盖优先于全局值）。"""
+    return tree.min_voltage_override.get(node, min_voltage)
+
+
+def _find_violations(tree: _Tree, min_voltage: float) -> tuple[list[dict], list[dict]]:
+    """按 EPS 容差判定超额定电流线段与欠压节点（恰好触限不算越限）。"""
     over_current_segments = []
-    for seg in segments:  # 保持输入顺序
-        current = seg_current[seg.id]
-        is_over = current > seg.rated_current + EPS
-        segment_results.append(
-            {
-                "segment_id": seg.id,
-                "parent": seg.parent,
-                "child": seg.child,
-                "current": _round(current),
-                "rated_current": seg.rated_current,
-                "resistance": seg.resistance,
-                "voltage_drop": _round(seg_drop[seg.id]),
-                "over_rated": is_over,
-            }
-        )
-        if is_over:
+    for seg in tree.segments:  # 保持输入顺序
+        current = tree.seg_current[seg.id]
+        if current > seg.rated_current + EPS:
             over_current_segments.append(
                 {
                     "segment_id": seg.id,
@@ -202,22 +240,11 @@ def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, l
                 }
             )
 
-    node_results = []
     under_voltage_nodes = []
-    for node in order:  # BFS 顺序，根在前
-        threshold = min_voltage_override.get(node, min_voltage)
-        voltage = node_voltage[node]
-        is_under = voltage < threshold - EPS
-        node_results.append(
-            {
-                "node": node,
-                "voltage": _round(voltage),
-                "min_voltage": threshold,
-                "load_current": _round(load_map.get(node, 0.0)),
-                "under_voltage": is_under,
-            }
-        )
-        if is_under:
+    for node in tree.order:  # BFS 顺序，根在前
+        threshold = _node_threshold(tree, node, min_voltage)
+        voltage = tree.node_voltage[node]
+        if voltage < threshold - EPS:
             under_voltage_nodes.append(
                 {
                     "node": node,
@@ -227,13 +254,128 @@ def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, l
                 }
             )
 
+    return over_current_segments, under_voltage_nodes
+
+
+def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, loads_in: Sequence) -> dict:
+    """执行压降校核，返回可 JSON 序列化的结果字典。"""
+    tree = _prepare_tree(source_voltage, segments_in, loads_in)
+    over_current_segments, under_voltage_nodes = _find_violations(tree, min_voltage)
+
+    segment_results = []
+    for seg in tree.segments:  # 保持输入顺序
+        current = tree.seg_current[seg.id]
+        segment_results.append(
+            {
+                "segment_id": seg.id,
+                "parent": seg.parent,
+                "child": seg.child,
+                "current": _round(current),
+                "rated_current": seg.rated_current,
+                "resistance": seg.resistance,
+                "voltage_drop": _round(current * seg.resistance),
+                "over_rated": current > seg.rated_current + EPS,
+            }
+        )
+
+    node_results = []
+    for node in tree.order:  # BFS 顺序，根在前
+        threshold = _node_threshold(tree, node, min_voltage)
+        voltage = tree.node_voltage[node]
+        node_results.append(
+            {
+                "node": node,
+                "voltage": _round(voltage),
+                "min_voltage": threshold,
+                "load_current": _round(tree.load_map.get(node, 0.0)),
+                "under_voltage": voltage < threshold - EPS,
+            }
+        )
+
     return {
         "ok": not over_current_segments and not under_voltage_nodes,
         "source_voltage": source_voltage,
         "min_voltage": min_voltage,
-        "total_source_current": _round(node_total[ROOT_NODE]),
+        "total_source_current": _round(tree.node_total[ROOT_NODE]),
         "segments": segment_results,
         "nodes": node_results,
         "over_current_segments": over_current_segments,
         "under_voltage_nodes": under_voltage_nodes,
+    }
+
+
+def capacity(
+    source_voltage: float,
+    min_voltage: float,
+    segments_in: Sequence,
+    loads_in: Sequence,
+    target_node: str,
+) -> dict:
+    """评估目标节点可追加的最大恒定负载电流。
+
+    新增电流 ΔI 仅改变目标到 source 路径上的线段电流；任一节点 n 的新增压降
+    = R_common(n, target) × ΔI，R_common 为两条根路径公共线段的电阻之和
+    （兄弟支路经公共上游线段同样受压）。最大 ΔI 受限于：
+    - 路径上每段的额定电流余量；
+    - 每个 R_common > 0 节点的欠压余量（零公共电阻节点不受影响）。
+    """
+    tree = _prepare_tree(source_voltage, segments_in, loads_in)
+
+    if target_node == ROOT_NODE:
+        raise InputValidationError("目标节点无效", [f"目标节点不能为根节点 '{ROOT_NODE}'"])
+    if target_node not in tree.parent_of:
+        raise InputValidationError("目标节点无效", [f"目标节点 '{target_node}' 不存在于树中"])
+
+    over_current_segments, under_voltage_nodes = _find_violations(tree, min_voltage)
+    if over_current_segments or under_voltage_nodes:
+        details = [
+            f"线段 '{v['segment_id']}' 已超额定电流：{v['current']} A（额定 {v['rated_current']} A）"
+            for v in over_current_segments
+        ]
+        details += [
+            f"节点 '{v['node']}' 已欠压：{v['voltage']} V（最低允许 {v['min_voltage']} V）"
+            for v in under_voltage_nodes
+        ]
+        raise BaselineViolationError("基线校核已存在超额定电流或欠压，无法评估可增容量", details)
+
+    # 目标到 source 路径上的线段
+    seg_by_child = {seg.child: seg for seg in tree.segments}
+    path_seg_ids: set[str] = set()
+    node = target_node
+    while node != ROOT_NODE:
+        seg = seg_by_child[node]
+        path_seg_ids.add(seg.id)
+        node = seg.parent
+
+    # 各节点与目标节点两条根路径的公共线段电阻之和（自根向叶累计）
+    common_resistance = {ROOT_NODE: 0.0}
+    for node in tree.order:
+        for seg in tree.children_map.get(node, []):
+            shared = seg.resistance if seg.id in path_seg_ids else 0.0
+            common_resistance[seg.child] = common_resistance[node] + shared
+
+    # 候选上限：(可追加电流, 限制类型, 标识)
+    limits: list[tuple[float, str, str]] = []
+    for seg in tree.segments:  # 保持输入顺序
+        if seg.id not in path_seg_ids:
+            continue
+        limits.append((seg.rated_current - tree.seg_current[seg.id], "segment", seg.id))
+    for node in tree.order:  # BFS 顺序，根在前
+        r_common = common_resistance[node]
+        if r_common <= 0.0:
+            continue  # 零公共电阻：该节点电压不受新增负载影响
+        headroom = tree.node_voltage[node] - _node_threshold(tree, node, min_voltage)
+        limits.append((headroom / r_common, "node", node))
+
+    raw_max = min(limit for limit, _, _ in limits)
+    limiting_factors = [
+        {"type": kind, "id": ident}
+        for limit, kind, ident in limits
+        if limit <= raw_max + EPS
+    ]
+
+    return {
+        "target_node": target_node,
+        "max_additional_current": _truncate(max(0.0, raw_max)),
+        "limiting_factors": limiting_factors,
     }

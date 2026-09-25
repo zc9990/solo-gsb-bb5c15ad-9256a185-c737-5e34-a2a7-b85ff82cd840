@@ -80,3 +80,22 @@ class EvaluateResponse(BaseModel):
     nodes: list[NodeResult]
     over_current_segments: list[OverCurrentViolation] = Field(description="超额定电流的线段")
     under_voltage_nodes: list[UnderVoltageViolation] = Field(description="欠压节点")
+
+
+class CapacityRequest(EvaluateRequest):
+    """增容评估请求：在 /evaluate 参数基础上指定目标节点。"""
+
+    target_node: str = Field(min_length=1, description="目标节点名称（须为已有的非 source 节点）")
+
+
+class LimitingFactor(BaseModel):
+    type: str = Field(description="限制类型：segment=线段额定电流，node=节点最低允许电压")
+    id: str = Field(description="达到上限的线段 id 或节点名称")
+
+
+class CapacityResponse(BaseModel):
+    target_node: str = Field(description="目标节点名称")
+    max_additional_current: float = Field(
+        description="目标节点可增加的最大恒定负载电流 (A)，向下截断至 6 位小数"
+    )
+    limiting_factors: list[LimitingFactor] = Field(description="达到上限的线段 / 节点")

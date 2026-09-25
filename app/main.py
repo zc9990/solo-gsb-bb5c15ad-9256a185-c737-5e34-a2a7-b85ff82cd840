@@ -6,17 +6,17 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .core import InputValidationError, evaluate
-from .models import EvaluateRequest, EvaluateResponse
+from .core import BaselineViolationError, InputValidationError, capacity, evaluate
+from .models import CapacityRequest, CapacityResponse, EvaluateRequest, EvaluateResponse
 
 app = FastAPI(
     title="直流配电树压降校核 API",
     description=(
         "接收以 source 为根的配电树（线段电阻 / 额定电流、节点恒定负载），"
         "自叶向根累计各段电流，自根向叶计算压降与节点电压，"
-        "并返回超额定电流与欠压位置。"
+        "返回超额定电流与欠压位置；并可评估指定节点可追加的最大恒定负载电流。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -37,6 +37,7 @@ _FIELD_LABELS = {
     "rated_current": "额定电流",
     "node": "节点",
     "current": "负载电流",
+    "target_node": "目标节点",
 }
 
 _CUSTOM_MESSAGES = {
@@ -93,6 +94,15 @@ async def input_validation_handler(request: Request, exc: InputValidationError) 
     )
 
 
+@app.exception_handler(BaselineViolationError)
+async def baseline_violation_handler(request: Request, exc: BaselineViolationError) -> JSONResponse:
+    details = [{"field": None, "message": item} for item in exc.details]
+    return JSONResponse(
+        status_code=400,
+        content=_error_body("baseline_violation", exc.message, details),
+    )
+
+
 @app.post(
     "/evaluate",
     response_model=EvaluateResponse,
@@ -107,6 +117,21 @@ def evaluate_endpoint(payload: EvaluateRequest) -> dict:
     )
 
 
+@app.post(
+    "/capacity",
+    response_model=CapacityResponse,
+    summary="评估目标节点可追加的最大恒定负载电流",
+)
+def capacity_endpoint(payload: CapacityRequest) -> dict:
+    return capacity(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        target_node=payload.target_node,
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -117,6 +142,7 @@ def index() -> dict:
     return {
         "service": "dc-tree-voltage-drop-api",
         "evaluate": "POST /evaluate",
+        "capacity": "POST /capacity",
         "docs": "/docs",
         "health": "/health",
     }
